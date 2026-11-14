@@ -1,12 +1,21 @@
 #include <SparkFun_ATECCX08a_Arduino_Library.h>
 #include <Wire.h>
 
+#define DEMO_ALL_PASS 1   // set to 0 once the biometric checks are real
+
 ATECCX08A atecc;
 
 const size_t MAX_LEN = 512;
-uint8_t buf[MAX_LEN];
+const char SUFFIX[] = "|authorized";
+uint8_t buf[MAX_LEN + sizeof(SUFFIX)];
 size_t len = 0;
+bool overflow = false;
 uint8_t myHash[32];
+
+// TODO: biometric teammate replaces these three
+bool checkPresence() { return DEMO_ALL_PASS; }
+bool checkLiveness() { return DEMO_ALL_PASS; }
+bool checkIdentity() { return DEMO_ALL_PASS; }
 
 void printHex(const uint8_t *d, size_t n) {
   for (size_t i = 0; i < n; i++) {
@@ -15,17 +24,55 @@ void printHex(const uint8_t *d, size_t n) {
   }
 }
 
-void signRequest() {
-  atecc.sha256(buf, len, myHash);
-  if (!atecc.createSignature(myHash)) {
-    Serial.println("{\"error\":\"sign_failed\"}");
+void extractId(char *out, size_t outSize) {
+  out[0] = 0;
+  buf[len] = 0;
+  const char *p = strstr((const char *)buf, "\"id\":\"");
+  if (!p) return;
+  p += 6;
+  size_t i = 0;
+  while (*p && *p != '"' && i < outSize - 1) out[i++] = *p++;
+  out[i] = 0;
+}
+
+void sendResult(const char *id, bool ok, const char *status, bool withSig) {
+  Serial.print("{\"type\":\"result\",\"id\":\"");
+  Serial.print(id);
+  Serial.print("\",\"ok\":");
+  Serial.print(ok ? "true" : "false");
+  Serial.print(",\"status\":\"");
+  Serial.print(status);
+  Serial.print("\"");
+  if (withSig) {
+    Serial.print(",\"sig\":\"");
+    printHex(atecc.signature, 64);
+    Serial.print("\"");
+  }
+  Serial.println("}");
+}
+
+void handleRequest() {
+  char id[65];
+  extractId(id, sizeof(id));
+
+  bool presence = checkPresence();
+  bool liveness = checkLiveness();
+  bool identity = checkIdentity();
+
+  if (!(presence && liveness && identity)) {
+    sendResult(id, false, "denied", false);
     return;
   }
-  Serial.print("{\"hash\":\"");
-  printHex(myHash, 32);
-  Serial.print("\",\"sig\":\"");
-  printHex(atecc.signature, 64);
-  Serial.println("\"}");
+
+  size_t sl = sizeof(SUFFIX) - 1;
+  memcpy(buf + len, SUFFIX, sl);
+  atecc.sha256(buf, len + sl, myHash);
+
+  if (!atecc.createSignature(myHash)) {
+    sendResult(id, false, "sign_failed", false);
+    return;
+  }
+  sendResult(id, true, "authorized", true);
 }
 
 void setup() {
@@ -50,10 +97,17 @@ void loop() {
     char c = Serial.read();
     if (c == '\r') continue;
     if (c == '\n') {
-      if (len > 0) signRequest();
+      if (overflow) {
+        Serial.println("{\"type\":\"result\",\"id\":\"\",\"ok\":false,\"status\":\"too_long\"}");
+      } else if (len > 0) {
+        handleRequest();
+      }
       len = 0;
+      overflow = false;
     } else if (len < MAX_LEN) {
       buf[len++] = c;
+    } else {
+      overflow = true;
     }
   }
 }
