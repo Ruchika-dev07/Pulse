@@ -9,6 +9,7 @@ import {
   EcgStrip,
   LiveChecks,
   REASONS,
+  SIGNATURE_LABELS,
   SIM_OPTIONS,
   formatTime,
   formatUsd,
@@ -395,6 +396,14 @@ function ResultView({ payment, onRetry, onNew, busy }) {
           <dt>{ok ? "Approved at" : "Ended at"}</dt>
           <dd>{formatTime(payment.completed_at)}</dd>
         </div>
+        {payment.signature && (
+          <div>
+            <dt>Device signature</dt>
+            <dd className={`sig is-${SIGNATURE_LABELS[payment.signature]?.tone || "muted"}`}>
+              {SIGNATURE_LABELS[payment.signature]?.text || payment.signature}
+            </dd>
+          </div>
+        )}
         <div>
           <dt>Receipt</dt>
           <dd className="ref" title={payment.receipt_hash || ""}>

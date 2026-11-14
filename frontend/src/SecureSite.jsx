@@ -10,6 +10,7 @@ import {
   HeartFace,
   LiveChecks,
   REASONS,
+  SIGNATURE_LABELS,
   formatDuration,
   formatTime,
 } from "./shared.jsx";
@@ -181,6 +182,11 @@ function Granted({ session, onLock, busy }) {
       <div className="session-meta">
         <span>Unlocked at {formatTime(session.session?.started_at)}</span>
         <span>Open for {formatDuration(session.session?.seconds || 0)}</span>
+        {session.session?.signature && (
+          <span className={`sig is-${SIGNATURE_LABELS[session.session.signature]?.tone || "muted"}`}>
+            {SIGNATURE_LABELS[session.session.signature]?.text}
+          </span>
+        )}
       </div>
 
       {vaultError && <p className="banner">{vaultError}</p>}

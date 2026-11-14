@@ -129,7 +129,34 @@ Wearable to laptop:
   is false for 1.5 s, or nothing arrives for 4 s, the open session locks.
 - Non-JSON lines are ignored, so debug prints are fine.
 
-## 5. API
+## 5. V2: signed approvals (ATECC608)
+
+The wearable's ATECC608 chip holds a private key that can never be read out. When all three
+checks pass, the firmware signs:
+
+```
+SHA-256( <exact request line it received, without the newline> + "|authorized" )
+```
+
+and adds the signature to the result line:
+
+```json
+{"type":"result","id":"<uuid>","ok":true,"status":"authorized","sig":"<128 hex chars, r||s>"}
+```
+
+The backend (`backend/device_key.py`, adapted from `ESP32-Biometric/verify.py`) recomputes the
+hash from the line it sent and verifies it with chip 1's public key.
+
+- The signed line includes the amount and payee, so a signature for $50 can't approve $5,000.
+- The request `id` is a fresh random nonce, and only pending requests accept a result, so a
+  recorded reply can't be replayed.
+- A wrong signature is always refused. `REQUIRE_SIGNATURE=true` also refuses unsigned replies.
+- The site shows **Verified by the security chip** on approved payments and unlocked sessions.
+- Firmware: `firmware/pulse_protocol/pulse_protocol.ino` has this built in (`USE_ATECC 1`).
+- Honest limit: the once-a-second `status` lines aren't signed yet, and the chip protects the
+  key, not the sensor wires.
+
+## 6. API
 
 | Method | Path | What it does |
 |---|---|---|
@@ -162,11 +189,9 @@ HTTP auth header; the wearable session isn't that kind of login.)
   (one-time claim secret), so another tab or machine can't pick it up.
 - Access is re-checked on every request: once the wearable reports it's off, the existing
   cookie stops working immediately.
-- Honest limits for V1: the serial link is not yet signed, so anything on the laptop that can
-  write to the serial port could fake a reply. V2 signs every reply with the ATECC608 key
-  (ECDSA P-256) and the backend verifies it.
+- Approvals are signed by the ATECC608 chip (ECDSA P-256) and verified on the laptop, so
+  software on the laptop can't fake an approval. Status lines aren't signed yet.
 
 ## Next
 
-- V2: device signs each result (ECDSA P-256, ATECC608); backend verifies with the device public key.
 - V3: HTTPS hosting on Vultr, GoDaddy domain, Solana devnet transfer behind the payment approval.

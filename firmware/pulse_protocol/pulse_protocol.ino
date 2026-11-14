@@ -6,10 +6,24 @@
   real drivers (touch pad, ECG 3 Click, R503 fingerprint). Everything else can stay.
 
   Library: ArduinoJson v7 (Library Manager: "ArduinoJson" by Benoit Blanchon)
+           SparkFun ATECCX08a Arduino Library (for V2 signing)
   Serial:  115200 baud, one JSON object per line.
+
+  V2 signing (USE_ATECC 1): when all three checks pass, the ATECC608 signs
+      SHA-256( <the exact request line received, no newline> + "|authorized" )
+  and the result line carries "sig": 128 hex chars (r||s). The laptop checks it with the
+  chip's public key (backend/device_key.py). Set USE_ATECC 0 to run without the chip.
 */
 
+#define USE_ATECC 1
+
 #include <ArduinoJson.h>
+#if USE_ATECC
+#include <Wire.h>
+#include <SparkFun_ATECCX08a_Arduino_Library.h>
+ATECCX08A atecc;
+bool ateccReady = false;
+#endif
 
 // ---------------- replace these with the real sensors ----------------
 
@@ -45,11 +59,31 @@ void sendCheck(const char* id, const char* check, bool ok) {
   sendJson(d);
 }
 
-void sendResult(const char* id, bool ok, const char* reason) {
+// Sign SHA-256(requestLine + "|authorized") with the chip. Writes 128 hex chars into out.
+bool signApproval(const String& requestLine, char* out) {
+#if USE_ATECC
+  if (!ateccReady) return false;
+  String msg = requestLine + "|authorized";
+  uint8_t digest[32];
+  atecc.sha256((uint8_t*)msg.c_str(), msg.length(), digest);
+  if (!atecc.createSignature(digest)) return false;
+  for (int i = 0; i < 64; i++) sprintf(out + 2 * i, "%02X", atecc.signature[i]);
+  out[128] = '\0';
+  return true;
+#else
+  return false;
+#endif
+}
+
+void sendResult(const char* id, bool ok, const char* reason, const String& requestLine) {
   JsonDocument d;
   d["type"] = "result"; d["id"] = id; d["ok"] = ok;
   d["status"] = ok ? "authorized" : "denied";
   if (!ok) d["reason"] = reason;
+  if (ok) {
+    char sig[129];
+    if (signApproval(requestLine, sig)) d["sig"] = sig;   // only approvals are signed
+  }
   sendJson(d);
 }
 
@@ -62,21 +96,22 @@ void sendStatus() {
   sendJson(d);
 }
 
-// Runs presence -> liveness -> identity, reporting each step, then the result.
-void runChecks(const char* id) {
+// Runs presence -> liveness -> identity, reporting each step, then the (signed) result.
+// requestLine is the exact line received; the signature covers it.
+void runChecks(const char* id, const String& requestLine) {
   bool worn = isTouching();
   sendCheck(id, "presence", worn);
-  if (!worn) { sendResult(id, false, "not_present"); return; }
+  if (!worn) { sendResult(id, false, "not_present", requestLine); return; }
 
   bool live = hasHeartbeat();
   sendCheck(id, "liveness", live);
-  if (!live) { sendResult(id, false, "no_heartbeat"); return; }
+  if (!live) { sendResult(id, false, "no_heartbeat", requestLine); return; }
 
   bool match = fingerprintMatches(20000);
   sendCheck(id, "identity", match);
-  if (!match) { sendResult(id, false, "wrong_finger"); return; }
+  if (!match) { sendResult(id, false, "wrong_finger", requestLine); return; }
 
-  sendResult(id, true, nullptr);
+  sendResult(id, true, nullptr, requestLine);
 }
 
 void handleLine(const String& text) {
@@ -91,10 +126,10 @@ void handleLine(const String& text) {
     float amount = in["amount"] | 0.0;
     const char* provider = in["provider"] | "";
     Serial.printf("# payment %.2f to %s\n", amount, provider);   // '#' lines are ignored by the laptop
-    runChecks(id);
+    runChecks(id, text);
   } else if (strcmp(type, "session_request") == 0) {
     // TODO (screen): show "Unlock site?"
-    runChecks(id);
+    runChecks(id, text);
   } else if (strcmp(type, "cancel") == 0) {
     // TODO: abort a fingerprint wait in progress
   }
@@ -103,6 +138,14 @@ void handleLine(const String& text) {
 void setup() {
   Serial.begin(115200);
   delay(500);
+#if USE_ATECC
+  Wire.begin();
+  if (atecc.begin()) {
+    atecc.readConfigZone(false);
+    ateccReady = atecc.configLockStatus && atecc.dataOTPLockStatus && atecc.slot0LockStatus;
+  }
+  Serial.println(ateccReady ? "# atecc ready: approvals will be signed" : "# atecc not found or not locked: approvals unsigned");
+#endif
   Serial.println("# pulse ready");
 }
 

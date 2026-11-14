@@ -32,6 +32,21 @@ export const REASONS = {
   },
   cancelled: { title: "Cancelled", body: "You cancelled this request before it was approved." },
   device_error: { title: "The device reported an error", body: "Restart the device and try again." },
+  bad_signature: {
+    title: "Signature didn’t check out",
+    body: "The reply wasn’t signed by this wearable’s security chip, so it was refused.",
+  },
+  unsigned: {
+    title: "Reply wasn’t signed",
+    body: "Signatures are required and the wearable didn’t sign this approval.",
+  },
+};
+
+export const SIGNATURE_LABELS = {
+  verified: { text: "Verified by the security chip", tone: "ok" },
+  simulated: { text: "Simulator, not signed", tone: "muted" },
+  missing: { text: "Not signed", tone: "warn" },
+  invalid: { text: "Invalid, refused", tone: "bad" },
 };
 
 export const END_REASONS = {

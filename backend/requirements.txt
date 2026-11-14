@@ -5,3 +5,4 @@ pyserial>=3.5
 pymongo[srv]>=4.6
 certifi>=2024.2.2
 python-dotenv>=1.0
+cryptography>=42.0

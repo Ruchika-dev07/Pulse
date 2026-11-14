@@ -251,6 +251,7 @@ def payment_event(p: dict) -> dict:
         "result": p["status"],
         "reason": p.get("reason"),
         "checks": p.get("checks"),
+        "signature": p.get("signature"),
         "at": p.get("completed_at"),
     }
 

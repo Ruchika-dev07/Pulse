@@ -1087,6 +1087,13 @@ input {
   margin: 6px 4px 4px !important;
 }
 
+/* ---------- device signature ---------- */
+
+.sig.is-ok { color: var(--ok); }
+.sig.is-warn { color: var(--warn); }
+.sig.is-bad { color: var(--bad); }
+.sig.is-muted { color: var(--muted); }
+
 /* ---------- responsive ---------- */
 
 @media (max-width: 900px) {

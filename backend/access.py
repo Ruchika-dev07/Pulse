@@ -126,7 +126,7 @@ class AccessManager:
                     self.request["checks"][msg["check"]] = "pass" if msg.get("ok") else "fail"
         elif kind == "result":
             if msg.get("ok"):
-                self._start(msg.get("id"))
+                self._start(msg.get("id"), msg.get("signature"))
             else:
                 self._fail(msg.get("id"), msg.get("reason") or "device_error")
 
@@ -177,12 +177,13 @@ class AccessManager:
                     "started_at": s["started_at"],
                     "seconds": int(now - s["started_ts"]),
                     "claimed": s["claimed"],
+                    "signature": s.get("signature"),
                 }
             return state
 
     # ---------------- internals ----------------
 
-    def _start(self, request_id: Optional[str]) -> None:
+    def _start(self, request_id: Optional[str], signature: Optional[str] = None) -> None:
         with self._lock:
             r = self.request
             if not r or r["id"] != request_id:
@@ -196,6 +197,7 @@ class AccessManager:
                 "claimed": False,
                 "started_at": now_iso(),
                 "started_ts": ts,
+                "signature": signature,
             }
             self.request = None
             self.bad_since = None
@@ -260,11 +262,20 @@ class AccessManager:
                     "duration_s": None,
                     "token_hash": _hash(s["token"]),  # never the token itself
                     "device_mode": self.device.mode,
+                    "signature": s.get("signature"),
                 }
             )
         except Exception:
             log.exception("Could not save session start")
-        self._receipt({"kind": "access", "result": "granted", "session_id": s["session_id"], "at": s["started_at"]})
+        self._receipt(
+            {
+                "kind": "access",
+                "result": "granted",
+                "session_id": s["session_id"],
+                "signature": s.get("signature"),
+                "at": s["started_at"],
+            }
+        )
 
     def _receipt(self, event: dict) -> None:
         try:

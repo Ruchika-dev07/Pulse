@@ -49,6 +49,7 @@ class DeviceLink:
         self._ser = None
         self._write_lock = threading.Lock()
         self._cancelled: set[str] = set()
+        self._sent: dict[str, str] = {}  # request id -> exact line sent (for signature checks)
 
         # simulator wearable state
         self.sim_worn = True
@@ -95,6 +96,10 @@ class DeviceLink:
             self._write({"type": "cancel", "id": request_id})
         else:
             self._cancelled.add(request_id)
+
+    def sent_line(self, request_id: str) -> Optional[str]:
+        """The exact bytes sent for a request, without the newline. The chip signs these."""
+        return self._sent.get(request_id)
 
     def set_sim(self, worn: Optional[bool] = None, live: Optional[bool] = None) -> dict:
         if worn is not None:
@@ -175,7 +180,13 @@ class DeviceLink:
                 time.sleep(3)
 
     def _write(self, msg: dict) -> None:
-        line = json.dumps(msg, separators=(",", ":")) + "\n"
+        body = json.dumps(msg, separators=(",", ":"))
+        line = body + "\n"
+        if msg.get("type") in ("payment_request", "session_request"):
+            self._sent[msg["id"]] = body
+            if len(self._sent) > 500:  # keep memory bounded
+                for old in list(self._sent)[:250]:
+                    self._sent.pop(old, None)
         with self._write_lock:
             if not (self._ser and self.connected):
                 log.error("Not connected, dropping: %s", line.strip())

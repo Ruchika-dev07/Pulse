@@ -11,6 +11,8 @@ Settings go in backend/.env (see .env.example):
   CONTINUOUS_CHECK                    true (default) = lock the site when the wearable is removed
   SIGNAL_TIMEOUT, REMOVAL_GRACE       seconds (defaults 4 and 1.5)
   SESSION_MAX_MINUTES                 default 30
+  REQUIRE_SIGNATURE                   true = refuse approvals not signed by the ATECC608 (V2)
+  DEVICE_PUBKEY                       chip public key, 128 hex chars (defaults to chip 1)
   ALLOWED_ORIGINS                     default http://localhost:5173,http://127.0.0.1:5173
 """
 
@@ -31,6 +33,7 @@ from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import HTMLResponse  # noqa: E402
 from pydantic import BaseModel, ConfigDict, Field  # noqa: E402
 
+import device_key  # noqa: E402
 import pages  # noqa: E402
 import storage  # noqa: E402
 from access import AccessManager  # noqa: E402
@@ -43,6 +46,7 @@ APPROVAL_TIMEOUT = int(os.getenv("APPROVAL_TIMEOUT", "30"))
 COOKIE = "pulse_session"
 REASON_TO_CHECK = {"not_present": "presence", "no_heartbeat": "liveness", "wrong_finger": "identity"}
 FINAL = {"authorized", "denied", "timeout", "cancelled"}
+REQUIRE_SIGNATURE = os.getenv("REQUIRE_SIGNATURE", "false").strip().lower() == "true"
 SimOutcome = Literal["authorized", "not_present", "no_heartbeat", "wrong_finger", "timeout"]
 
 store = storage.open_store()
@@ -78,11 +82,12 @@ def handle_payment_message(msg: dict) -> None:
     elif kind == "result":
         t = now_iso()
         if msg.get("ok"):
-            fields = {"status": "authorized", "completed_at": t, "updated_at": t}
+            fields = {"status": "authorized", "completed_at": t, "updated_at": t, "signature": msg.get("signature")}
             fields.update({f"checks.{c}": "pass" for c in CHECK_ORDER})
         else:
             reason = msg.get("reason") or "device_error"
-            fields = {"status": "denied", "reason": reason, "completed_at": t, "updated_at": t}
+            fields = {"status": "denied", "reason": reason, "completed_at": t, "updated_at": t,
+                      "signature": msg.get("signature")}
             if reason in REASON_TO_CHECK:
                 fields[f"checks.{REASON_TO_CHECK[reason]}"] = "fail"
         updated = store.update_pending(pid, fields)
@@ -98,8 +103,38 @@ def handle_payment_message(msg: dict) -> None:
 access: Optional[AccessManager] = None
 
 
+def check_signature(msg: dict) -> dict:
+    """V2: an approval only counts if the wearable's ATECC608 chip signed it.
+
+    Adds "signature": verified | invalid | missing | simulated. An invalid signature is always
+    refused. A missing one is refused only when REQUIRE_SIGNATURE=true.
+    """
+    if msg.get("type") != "result" or not msg.get("ok"):
+        return msg
+    if device.mode == "sim":
+        return {**msg, "signature": "simulated"}
+
+    line = device.sent_line(msg.get("id", ""))
+    sig = msg.get("sig")
+    if sig and line and device_key.verify_approval(line, sig):
+        return {**msg, "signature": "verified"}
+
+    state = "invalid" if sig else "missing"
+    if state == "invalid" or REQUIRE_SIGNATURE:
+        log.warning("Refusing approval for %s: signature %s", msg.get("id"), state)
+        return {
+            **msg,
+            "ok": False,
+            "status": "denied",
+            "reason": "bad_signature" if state == "invalid" else "unsigned",
+            "signature": state,
+        }
+    return {**msg, "signature": state}
+
+
 def on_device_message(msg: dict) -> None:
     kind = msg.get("type")
+    msg = check_signature(msg)
     try:
         if kind == "status":
             if access:
@@ -158,6 +193,7 @@ def health():
         "timeout_seconds": APPROVAL_TIMEOUT,
         "device": device.status(),
         "storage": {"kind": store.kind, "error": store.error},
+        "signature": {"required": REQUIRE_SIGNATURE, "chip": "ATECC608 chip 1 (01238D68A84D0601EE)"},
     }
 
 
@@ -274,6 +310,7 @@ def create_payment(body: PaymentIn):
         "device_mode": device.mode,
         "receipt_seq": None,
         "receipt_hash": None,
+        "signature": None,
         "created_ts": ts,
     }
     try:
