@@ -3,8 +3,7 @@
 const BASE = import.meta.env.VITE_API_BASE ?? "";
 
 // Where the raw server-rendered protected page lives (FastAPI serves /secret directly).
-export const SECRET_PAGE_URL =
-  import.meta.env.VITE_SECRET_URL ?? `${window.location.protocol}//${window.location.hostname}:8000/secret`;
+export const SECRET_PAGE_URL = import.meta.env.VITE_SECRET_URL ?? "/secret";
 
 export class ApiError extends Error {
   constructor(message, status) {

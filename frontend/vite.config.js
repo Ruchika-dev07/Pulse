@@ -1,13 +1,16 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-// In dev, /api/* is proxied to the FastAPI backend, so no CORS setup is needed.
+const BACKEND = process.env.VITE_BACKEND_URL || "http://localhost:8000";
+
 export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
+    allowedHosts: ["noheartnocart.biz", ".noheartnocart.biz"],
     proxy: {
-      "/api": process.env.VITE_BACKEND_URL || "http://localhost:8000",
+      "/api": BACKEND,
+      "/secret": BACKEND,
     },
   },
 });
