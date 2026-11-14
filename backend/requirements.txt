@@ -1,0 +1,7 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+pyserial>=3.5
+pymongo[srv]>=4.6
+certifi>=2024.2.2
+python-dotenv>=1.0
