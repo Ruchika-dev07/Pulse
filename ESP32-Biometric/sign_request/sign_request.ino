@@ -6,6 +6,7 @@ ATECCX08A atecc;
 const size_t MAX_LEN = 512;
 uint8_t buf[MAX_LEN + 16];
 size_t len = 0;
+bool overflow = false;
 uint8_t myHash[32];
 
 bool checkPresence() { return true; }
@@ -92,10 +93,17 @@ void loop() {
     char c = Serial.read();
     if (c == '\r') continue;
     if (c == '\n') {
-      if (len > 0) signRequest();
+      if (overflow) {
+        Serial.println("{\"type\":\"result\",\"ok\":false,\"status\":\"too_long\"}");
+      } else if (len > 0) {
+        signRequest();
+      }
       len = 0;
+      overflow = false;
     } else if (len < MAX_LEN) {
       buf[len++] = c;
+    } else {
+      overflow = true;
     }
   }
 }
