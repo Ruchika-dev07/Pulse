@@ -16,6 +16,14 @@
 #include <Arduino.h>
 #include <R503Lib.h>
 #include <MAX30003.h>
+#include <Network.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <SparkFun_Qwiic_OLED.h>
+#include <SparkFun_ATECCX08a_Arduino_Library.h>
 
 static const uint8_t R503_RX_PIN = 44;
 static const uint8_t R503_TX_PIN = 43;
@@ -63,6 +71,249 @@ uint16_t templateCount();
 String readLine();
 void reportAuth(bool fingerOk, uint16_t fingerId, uint16_t confidence, bool ecgOk,
                 uint16_t bpm, uint16_t rrMs, const char *detail);
+
+// =====================================================================
+// PULSE ONLINE MODE (Wi-Fi): approve website payments/unlocks with the
+// real heartbeat + fingerprint, sign with the ATECC608, clean OLED.
+// Menu (type m over USB) still works for enrolling fingers.
+// =====================================================================
+
+// ---- settings ----
+const char *WIFI_SSID  = "YOUR_WIFI_NAME";
+const char *WIFI_PASS  = "YOUR_WIFI_PASSWORD";
+const char *BASE_URL   = "https://noheartnocart.biz";
+const char *DEVICE_KEY = "";                 // DEVICE_TOKEN from backend .env, or "" if unset
+static const uint32_t HEARTBEAT_WAIT_MS = 8000;
+static const uint32_t FINGER_WAIT_MS    = 20000;
+
+QwiicNarrowOLED oled;   // SparkFun 0.91" 128x32, same library as the working display code
+bool oledReady = false;
+ATECCX08A atecc;
+bool ateccReady = false;
+WiFiClientSecure tls;
+uint16_t lastBpm = 0;
+
+void showLines(const String &a, const String &b = "", const String &c = "") {
+  if (!oledReady) return;
+  oled.erase();                              // wipe old pixels (fixes the garbage)
+  oled.text(0, 0,  a.substring(0, 21).c_str());
+  oled.text(0, 11, b.substring(0, 21).c_str());
+  oled.text(0, 22, c.substring(0, 21).c_str());
+  oled.display();
+}
+
+// Heartbeat = "device is worn" + "live heartbeat". Any R-R reading counts.
+bool readBpmNow(uint16_t &bpm) {
+  if (!ecgPresent) return false;
+  if (!ecgConfigured) ecgConfigured = ecg.configureEcg();
+  uint16_t rr = 0, b = 0;
+  if (ecg.readHeartRate(b, rr) && b > 0) { bpm = b; lastBpm = b; return true; }
+  return false;
+}
+
+bool waitHeartbeat(uint32_t timeoutMs, uint16_t &bpm) {
+  unsigned long t0 = millis();
+  while (millis() - t0 < timeoutMs) {
+    if (readBpmNow(bpm)) return true;
+    delay(200);
+  }
+  return false;
+}
+
+// true only if an enrolled finger matches
+bool fingerMatch(uint32_t timeoutMs, uint16_t &id, uint16_t &conf) {
+  if (!fpsPresent) return false;
+  fps.setAuraLED(aLEDBreathing, aLEDBlue, 50, 255);
+  unsigned long t0 = millis();
+  uint8_t rc = R503_NO_FINGER;
+  while (millis() - t0 < timeoutMs) {
+    rc = fps.takeImage();
+    if (rc != R503_NO_FINGER) break;
+    delay(80);
+  }
+  if (rc != R503_OK) { fps.setAuraLED(aLEDFlash, aLEDRed, 50, 3); return false; }
+  if (fps.extractFeatures(1) != R503_OK) { fps.setAuraLED(aLEDFlash, aLEDRed, 50, 3); return false; }
+  id = 0; conf = 0;
+  bool ok = fps.searchFinger(1, id, conf) == R503_OK;
+  fps.setAuraLED(aLEDBreathing, ok ? aLEDGreen : aLEDRed, 255, 1);
+  unsigned long lift = millis();             // wait for lift, max 3 s
+  while (fps.takeImage() != R503_NO_FINGER && millis() - lift < 3000) delay(80);
+  return ok;
+}
+
+String signApproval(const String &line) {
+  if (!ateccReady) return "";
+  String msg = line + "|authorized";
+  uint8_t digest[32];
+  atecc.sha256((uint8_t *)msg.c_str(), msg.length(), digest);
+  if (!atecc.createSignature(digest)) return "";
+  char out[129];
+  for (int i = 0; i < 64; i++) sprintf(out + 2 * i, "%02X", atecc.signature[i]);
+  out[128] = 0;
+  return String(out);
+}
+
+String httpGet(const String &path) {
+  HTTPClient http;
+  http.setTimeout(5000);
+  if (!http.begin(tls, String(BASE_URL) + path)) return "";
+  if (strlen(DEVICE_KEY)) http.addHeader("X-Device-Key", DEVICE_KEY);
+  int code = http.GET();
+  String body = code == 200 ? http.getString() : "";
+  if (code != 200) Serial.printf("[net] GET %s -> %d\n", path.c_str(), code);
+  http.end();
+  return body;
+}
+
+void sendEvent(JsonDocument &doc) {
+  String body;
+  serializeJson(doc, body);
+  HTTPClient http;
+  http.setTimeout(5000);
+  if (!http.begin(tls, String(BASE_URL) + "/api/device/event")) return;
+  if (strlen(DEVICE_KEY)) http.addHeader("X-Device-Key", DEVICE_KEY);
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST(body);
+  if (code != 200) Serial.printf("[net] POST event -> %d\n", code);
+  http.end();
+}
+
+void sendCheck(const String &id, const char *check, bool ok) {
+  JsonDocument d;
+  d["type"] = "check"; d["id"] = id; d["check"] = check; d["ok"] = ok;
+  sendEvent(d);
+}
+
+void sendResult(const String &id, bool ok, const char *reason, const String &sig) {
+  JsonDocument d;
+  d["type"] = "result"; d["id"] = id; d["ok"] = ok;
+  d["status"] = ok ? "authorized" : "denied";
+  if (!ok) d["reason"] = reason;
+  if (ok && sig.length()) d["sig"] = sig;
+  sendEvent(d);
+}
+
+void sendStatus() {
+  uint16_t b = 0;
+  bool live = readBpmNow(b);
+  JsonDocument d;
+  d["type"] = "status"; d["worn"] = live; d["live"] = live;
+  if (live) d["bpm"] = b; else d["bpm"] = nullptr;
+  sendEvent(d);
+}
+
+void approveRequest(JsonDocument &req) {
+  String id = req["id"].as<String>();
+  String line = req["line"].as<String>();
+  String type = req["type"].as<String>();
+  Serial.printf("[pulse] request %s %s\n", type.c_str(), id.c_str());
+
+  if (type == "payment_request")
+    showLines("Approve payment?", req["provider"].as<String>(), "$" + String(req["amount"].as<float>(), 2));
+  else
+    showLines("Unlock request", "Pads on, then finger");
+  delay(1000);
+
+  // 1+2: heartbeat (worn + alive)
+  showLines("Checking heartbeat", "Keep the pads on");
+  uint16_t bpm = 0;
+  bool live = waitHeartbeat(HEARTBEAT_WAIT_MS, bpm);
+  sendCheck(id, "liveness", live);           // backend also marks "device is worn"
+  Serial.printf("[pulse] heartbeat %s bpm=%u\n", live ? "ok" : "none", bpm);
+  if (!live) {
+    showLines("DENIED", "No heartbeat");
+    sendResult(id, false, "no_heartbeat", "");
+    delay(2000);
+    return;
+  }
+
+  // 3: fingerprint
+  showLines("Heart " + String(bpm) + " bpm", "Place your finger", "on the sensor");
+  uint16_t fid = 0, conf = 0;
+  bool match = fingerMatch(FINGER_WAIT_MS, fid, conf);
+  sendCheck(id, "identity", match);
+  Serial.printf("[pulse] fingerprint %s id=%u conf=%u\n", match ? "MATCH" : "no match", fid, conf);
+  if (!match) {
+    showLines("DENIED", "Fingerprint", "didn't match");
+    sendResult(id, false, "wrong_finger", "");
+    delay(2000);
+    return;
+  }
+
+  String sig = signApproval(line);
+  sendResult(id, true, "", sig);
+  showLines("APPROVED", sig.length() ? "Signed by chip" : "(not signed)");
+  Serial.printf("[pulse] approved, %s\n", sig.length() ? "signed" : "UNSIGNED");
+  delay(2000);
+}
+
+void showLatestPayment() {
+  String body = httpGet("/api/payments?limit=1");
+  if (!body.length()) { showLines("Pulse", "Waiting for server"); return; }
+  JsonDocument doc;
+  if (deserializeJson(doc, body) || !doc.is<JsonArray>() || doc.as<JsonArray>().size() == 0) {
+    showLines("Pulse", "No payments yet");
+    return;
+  }
+  JsonObject p = doc[0];
+  String st = p["status"].as<String>();
+  st.toUpperCase();
+  showLines(p["provider"].as<String>(), "$" + String(p["amount"].as<float>(), 2), st);
+}
+
+void onlineBegin() {
+  Wire.begin();
+  Wire1.begin();
+  oledReady = oled.begin(Wire1, 0x3C);
+  Serial.println(oledReady ? " >> OLED ready" : " [!] OLED not found on Qwiic");
+  if (oledReady) { oled.erase(); oled.display(); }
+  showLines("Pulse", "Starting...");
+
+  if (atecc.begin()) {
+    atecc.readConfigZone(false);
+    ateccReady = atecc.configLockStatus && atecc.dataOTPLockStatus && atecc.slot0LockStatus;
+  }
+  Serial.println(ateccReady ? " >> ATECC608 ready: approvals will be signed" : " [!] ATECC608 not ready: approvals unsigned");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  showLines("Pulse", "Connecting Wi-Fi...");
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(300);
+  tls.setInsecure();                         // demo: approvals themselves are chip-signed
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf(" >> Wi-Fi connected %s\n", WiFi.localIP().toString().c_str());
+    showLines("Pulse online", WiFi.localIP().toString());
+  } else {
+    Serial.println(" [!] Wi-Fi not connected yet (will keep trying)");
+    showLines("Pulse", "No Wi-Fi yet");
+  }
+}
+
+void onlineTick() {
+  static unsigned long lastStatus = 0, lastPoll = 0, lastIdle = 0, lastRetry = 0;
+  if (WiFi.status() != WL_CONNECTED) {
+    if (millis() - lastRetry > 30000) { lastRetry = millis(); WiFi.disconnect(); WiFi.begin(WIFI_SSID, WIFI_PASS); showLines("Pulse", "Reconnecting Wi-Fi"); }
+    delay(50);
+    return;
+  }
+  if (millis() - lastPoll > 1000) {
+    lastPoll = millis();
+    String body = httpGet("/api/device/next");
+    if (body.length()) {
+      JsonDocument req;
+      if (!deserializeJson(req, body) && strcmp(req["type"] | "none", "none") != 0) {
+        approveRequest(req);
+        lastIdle = 0;
+        return;
+      }
+    }
+  }
+  if (millis() - lastStatus > 2000) { lastStatus = millis(); sendStatus(); }
+  if (millis() - lastIdle > 5000) { lastIdle = millis(); showLatestPayment(); }
+}
+// =====================================================================
+
 
 void setup() {
   Serial.begin(115200);
@@ -129,6 +380,8 @@ void setup() {
   Serial.printf("    Stored fingerprints: %u\n", count);
   Serial.println("Type m for menu, g for ECG status, a for auth, h for help.");
 
+  onlineBegin();
+
   // Always land in menu when no finger sensor / no templates — ECG bring-up friendly
   if (!fpsPresent || count == 0) {
     enterMenu();
@@ -164,7 +417,7 @@ void loop() {
   }
 
   if (mode == MODE_AUTH) {
-    runAuthOnce();
+    onlineTick();   // Wi-Fi: approve website requests (was runAuthOnce)
   } else {
     delay(20);
   }
@@ -208,8 +461,8 @@ void enterAuth() {
   mode = MODE_AUTH;
   fps.setAuraLED(aLEDBreathing, aLEDBlue, 50, 255);
   Serial.println();
-  Serial.println("== AUTH MODE ============================");
-  Serial.println("Place enrolled finger on the sensor...");
+  Serial.println("== ONLINE MODE ==========================");
+  Serial.println("Waiting for payments/unlocks from noheartnocart.biz (type m for menu)");
 }
 
 void runAuthOnce() {
