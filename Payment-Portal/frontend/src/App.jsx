@@ -224,7 +224,11 @@ function DevicePill({ health, backendDown }) {
     hint = "Run: uvicorn main:app --reload --port 8000";
   } else if (health) {
     const d = health.device;
-    if (d.mode === "sim") {
+    if (d.mode === "wifi") {
+      tone = d.connected ? "ok" : "bad";
+      text = d.connected ? "Wearable on Wi-Fi" : "Wearable offline";
+      hint = d.connected ? "The wearable is polling over Wi-Fi" : "No request from the wearable in the last 10 s";
+    } else if (d.mode === "sim") {
       tone = "warn";
       text = "Simulated device";
       hint = "Set DEVICE_MODE=serial and SERIAL_PORT to use the real ESP32";

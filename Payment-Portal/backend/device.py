@@ -41,7 +41,8 @@ FAILS_AT = {"not_present": "presence", "no_heartbeat": "liveness", "wrong_finger
 class DeviceLink:
     def __init__(self, on_message: Callable[[dict], None]):
         self.on_message = on_message
-        self.mode = "serial" if os.getenv("DEVICE_MODE", "sim").strip().lower() == "serial" else "sim"
+        requested = os.getenv("DEVICE_MODE", "sim").strip().lower()
+        self.mode = requested if requested in ("serial", "wifi") else "sim"
         self.port = os.getenv("SERIAL_PORT", "").strip() or None
         self.baud = int(os.getenv("SERIAL_BAUD", "115200"))
         self.connected = False
@@ -51,6 +52,11 @@ class DeviceLink:
         self._cancelled: set[str] = set()
         self._sent: dict[str, str] = {}  # request id -> exact line sent (for signature checks)
 
+        # Wi-Fi mode: requests wait here until the wearable polls GET /api/device/next
+        self._queue: dict[str, dict] = {}  # id -> {"msg", "line", "created", "delivered"}
+        self._queue_lock = threading.Lock()
+        self.last_seen: Optional[float] = None
+
         # simulator wearable state
         self.sim_worn = True
         self.sim_live = True
@@ -58,6 +64,8 @@ class DeviceLink:
 
         if self.mode == "serial":
             threading.Thread(target=self._serial_loop, daemon=True, name="serial-reader").start()
+        elif self.mode == "wifi":
+            log.info("Device mode: Wi-Fi (wearable polls /api/device/next and posts to /api/device/event)")
         else:
             log.info("Device mode: simulator")
             threading.Thread(target=self._sim_status_loop, daemon=True, name="sim-status").start()
@@ -69,9 +77,11 @@ class DeviceLink:
             "mode": self.mode,
             "port": self.port,
             "baud": self.baud,
-            "connected": self.connected if self.mode == "serial" else True,
+            "connected": self._is_connected(),
             "error": self.error,
         }
+        if self.mode == "wifi":
+            out["last_seen_seconds"] = round(time.time() - self.last_seen, 1) if self.last_seen else None
         if self.mode == "sim":
             out["sim"] = {"worn": self.sim_worn, "live": self.sim_live}
         return out
@@ -94,8 +104,43 @@ class DeviceLink:
     def cancel(self, request_id: str) -> None:
         if self.mode == "serial":
             self._write({"type": "cancel", "id": request_id})
+        elif self.mode == "wifi":
+            with self._queue_lock:
+                self._queue.pop(request_id, None)
         else:
             self._cancelled.add(request_id)
+
+    # ---------- Wi-Fi mode ----------
+
+    def _is_connected(self) -> bool:
+        if self.mode == "serial":
+            return self.connected
+        if self.mode == "wifi":
+            return bool(self.last_seen and time.time() - self.last_seen < 10)
+        return True
+
+    def mark_seen(self) -> None:
+        self.last_seen = time.time()
+
+    def next_request(self) -> Optional[dict]:
+        """The oldest request waiting for the wearable. Handed out once; re-offered after 20 s
+        without a result (e.g. the wearable rebooted mid-check)."""
+        self.mark_seen()
+        now = time.time()
+        with self._queue_lock:
+            for rid in list(self._queue):
+                if now - self._queue[rid]["created"] > 120:
+                    self._queue.pop(rid, None)  # long expired
+            for rid, item in sorted(self._queue.items(), key=lambda kv: kv[1]["created"]):
+                if item["delivered"] is None or now - item["delivered"] > 20:
+                    item["delivered"] = now
+                    return {**item["msg"], "line": item["line"]}
+        return None
+
+    def complete(self, request_id: Optional[str]) -> None:
+        if request_id:
+            with self._queue_lock:
+                self._queue.pop(request_id, None)
 
     def sent_line(self, request_id: str) -> Optional[str]:
         """The exact bytes sent for a request, without the newline. The chip signs these."""
@@ -115,6 +160,13 @@ class DeviceLink:
     def _send(self, msg: dict, sim_outcome: Optional[str]) -> None:
         if self.mode == "serial":
             self._write(msg)
+            return
+        if self.mode == "wifi":
+            line = json.dumps(msg, separators=(",", ":"))
+            self._sent[msg["id"]] = line
+            with self._queue_lock:
+                self._queue[msg["id"]] = {"msg": msg, "line": line, "created": time.time(), "delivered": None}
+            log.info("Queued for the wearable: %s", line)
             return
         outcome = sim_outcome if sim_outcome in SIM_OUTCOMES else "authorized"
         # a simulated wearable that's off or has no pulse can't pass, whatever the demo setting

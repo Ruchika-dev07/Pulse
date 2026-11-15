@@ -51,6 +51,7 @@ COOKIE = "pulse_session"
 REASON_TO_CHECK = {"not_present": "presence", "no_heartbeat": "liveness", "wrong_finger": "identity"}
 FINAL = {"authorized", "denied", "timeout", "cancelled"}
 REQUIRE_SIGNATURE = os.getenv("REQUIRE_SIGNATURE", "false").strip().lower() == "true"
+DEVICE_TOKEN = os.getenv("DEVICE_TOKEN", "").strip()  # Wi-Fi wearable must send X-Device-Key
 SimOutcome = Literal["authorized", "not_present", "no_heartbeat", "wrong_finger", "timeout"]
 
 store = storage.open_store()
@@ -144,7 +145,33 @@ def check_signature(msg: dict) -> dict:
     return {**msg, "signature": state}
 
 
+PRESENCE_FROM_HEARTBEAT = os.getenv("PRESENCE_FROM_HEARTBEAT", "true").lower() in ("1", "true", "yes")
+
+
+def _presence_from_heartbeat(msg: dict) -> list[dict]:
+    """The wearable proves it's worn with the ECG heartbeat (no separate touch pad).
+    Keep three rows on the website: a heartbeat check also answers "device is worn"."""
+    kind = msg.get("type")
+    if kind == "status":
+        return [{**msg, "worn": bool(msg.get("live"))}]
+    if kind == "check" and msg.get("check") == "liveness":
+        return [{**msg, "check": "presence"}, msg]
+    if kind == "check" and msg.get("check") == "presence":
+        return []  # derived from the heartbeat instead
+    if kind == "result" and not msg.get("ok") and msg.get("reason") == "no_heartbeat":
+        return [{**msg, "reason": "not_present"}]
+    return [msg]
+
+
 def on_device_message(msg: dict) -> None:
+    if PRESENCE_FROM_HEARTBEAT:
+        for m in _presence_from_heartbeat(msg):
+            _on_device_message(m)
+        return
+    _on_device_message(msg)
+
+
+def _on_device_message(msg: dict) -> None:
     kind = msg.get("type")
     msg = check_signature(msg)
     try:
@@ -155,6 +182,8 @@ def on_device_message(msg: dict) -> None:
             if access:
                 access.handle_session_end(msg.get("reason") or "removed")
         elif kind in ("check", "result") and msg.get("id"):
+            if kind == "result":
+                device.complete(msg.get("id"))
             if access and access.owns(msg["id"]):
                 access.handle_device(msg)
             else:
@@ -461,6 +490,44 @@ def list_receipts(limit: int = 50):
 @app.get("/api/receipts/verify")
 def verify_receipts():
     return storage.verify_chain(store)
+
+
+# ---------------- Wi-Fi wearable ----------------
+
+
+def _check_device_key(request: Request) -> None:
+    if DEVICE_TOKEN and request.headers.get("X-Device-Key", "") != DEVICE_TOKEN:
+        raise HTTPException(401, "Bad device key")
+
+
+@app.get("/api/device/next")
+def device_next(request: Request):
+    """The wearable polls this (about once a second). Returns the next request to approve, or {"type":"none"}.
+    "line" is the exact text to sign: SHA-256(line + "|authorized")."""
+    _check_device_key(request)
+    if device.mode != "wifi":
+        raise HTTPException(409, "Set DEVICE_MODE=wifi in backend/.env to use the Wi-Fi wearable")
+    return device.next_request() or {"type": "none"}
+
+
+@app.post("/api/device/event")
+async def device_event(request: Request):
+    """The wearable posts the same JSON messages as the serial protocol:
+    check, result (with sig), status (every second), session_end."""
+    _check_device_key(request)
+    if device.mode != "wifi":
+        raise HTTPException(409, "Set DEVICE_MODE=wifi in backend/.env to use the Wi-Fi wearable")
+    try:
+        msg = await request.json()
+    except ValueError:
+        raise HTTPException(400, "Body must be JSON") from None
+    if not isinstance(msg, dict) or "type" not in msg:
+        raise HTTPException(400, 'Body must be a JSON object with a "type"')
+    device.mark_seen()
+    if msg.get("type") != "status":
+        log.info("wearable (wifi) -> %s", json.dumps(msg, separators=(",", ":")))
+    on_device_message(msg)
+    return {"ok": True}
 
 
 # ---------------- simulator controls ----------------
