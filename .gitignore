@@ -8,6 +8,12 @@ __pycache__/
 node_modules/
 dist/
 
+# PlatformIO
+.pio/
+
+# Vendor reference clones (drivers live under ESP32-Biometric/lib/)
+ESP32-Biometric/vendor/
+
 # OS / editors
 .DS_Store
 .vscode/
